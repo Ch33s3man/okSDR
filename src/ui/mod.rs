@@ -3,6 +3,7 @@ pub mod rf_display;
 pub mod af_display;
 pub mod cw_display;
 pub mod controls;
+pub mod connection_dialog;
 pub mod recording_deck;
 pub mod app;
 

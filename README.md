@@ -89,7 +89,7 @@ Install the required system packages:
 ```bash
 # Debian / Ubuntu / Linux Mint
 sudo apt update
-sudo apt install -y build-essential libasound2-dev libudev-dev hamlib-utils git
+sudo apt install -y build-essential libasound2-dev libudev-dev libhamlib-utils git
 ```
 
 Ensure your user account has access to serial ports:
@@ -122,11 +122,18 @@ sudo usermod -aG dialout $USER
 ## Launching
 
 ### Launcher Script (Recommended)
-Use the included `run.sh` script, which automatically checks serial ports, ensures `rigctld` is running with the G90 profile (`-m 3089 -s 19200`), and launches the optimized binary:
+Use the included `run.sh` script to launch okSDR:
 
 ```bash
 ./run.sh
 ```
+
+On startup, okSDR presents a **Radio Connection** screen where you can:
+* Review or choose your serial port (`/dev/ttyUSB*`, `/dev/serial/by-id/*`, etc.)
+* Select the G90 baud rate (19200 default) and CI-V address (`0x70`)
+* Click **Test CAT** to safely query the G90's frequency and mode (with DTR/RTS held strictly LOW so the transmitter is never keyed)
+* Click **Connect** to initialize Hamlib `rigctld` (Model 3088) with full PTT protection (`dtr_state=OFF,rts_state=OFF,ptt_type=None`)
+* Or click **Continue without CAT** to run the SDR in audio/visual mode without rig sync.
 
 ### Desktop Shortcut
 To create a desktop shortcut:

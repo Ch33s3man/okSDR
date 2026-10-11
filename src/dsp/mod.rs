@@ -5,6 +5,7 @@ pub mod demod;
 pub mod agc;
 pub mod fft;
 pub mod cw;
+pub mod noise;
 
 use num_complex::Complex32;
 use crate::state::{RadioMode, SdrState};
@@ -15,6 +16,7 @@ use demod::Demodulator;
 use agc::Agc;
 use fft::SpectrumFft;
 use cw::CwDecoder;
+use noise::{AudioSquelch, AutoNotchFilter, LmsNoiseReduction, NoiseBlanker};
 
 pub const RF_FFT_SIZE: usize = 2048;
 pub const AF_FFT_SIZE: usize = 1024;
@@ -29,6 +31,10 @@ pub struct DspPipeline {
     pub af_fft: SpectrumFft,
     pub cw_decoder: CwDecoder,
     pub cw_chars_buffer: Vec<char>,
+    pub noise_blanker: NoiseBlanker,
+    pub lms_nr: LmsNoiseReduction,
+    pub auto_notch: AutoNotchFilter,
+    pub squelch: AudioSquelch,
 
     // Buffers for FFTs
     rf_fft_accumulator: Vec<Complex32>,
@@ -58,6 +64,10 @@ impl DspPipeline {
             af_fft: SpectrumFft::new(AF_FFT_SIZE, 0.5),
             cw_decoder: CwDecoder::new(decimate_rate),
             cw_chars_buffer: Vec::new(),
+            noise_blanker: NoiseBlanker::new(),
+            lms_nr: LmsNoiseReduction::new(),
+            auto_notch: AutoNotchFilter::new(),
+            squelch: AudioSquelch::new(),
 
             rf_fft_accumulator: Vec::with_capacity(RF_FFT_SIZE),
             af_fft_accumulator: Vec::with_capacity(AF_FFT_SIZE),
@@ -115,6 +125,16 @@ impl DspPipeline {
         let c0 = self.iq_corrector.process(i0, q0, &state.iq_cal);
         let c1 = self.iq_corrector.process(i1, q1, &state.iq_cal);
 
+        // Noise Blanker (NB) on raw 96 kHz baseband before decimation and FIR filtering
+        let (c0, c1) = if state.noise.nb_enabled {
+            (
+                self.noise_blanker.process(c0, state.noise.nb_threshold),
+                self.noise_blanker.process(c1, state.noise.nb_threshold),
+            )
+        } else {
+            (c0, c1)
+        };
+
         // Step 2: Accumulate for RF FFT
         let mut rf_spectrum = None;
         self.rf_fft_accumulator.push(c0);
@@ -143,19 +163,34 @@ impl DspPipeline {
             self.rms_count = 0;
         }
 
-        // Squelch check
-        let is_squelched = self.latest_s_meter.2 < state.squelch_db;
-
         // Step 6: Demodulation
-        let raw_audio = if is_squelched {
-            0.0
-        } else {
-            self.demodulator.demodulate(filtered, state.mode)
-        };
+        let raw_audio = self.demodulator.demodulate(filtered, state.mode);
 
         // Step 7: AGC
         let agc_audio = self.agc.process(raw_audio, state.agc_speed, state.agc_gain);
-        let final_audio = (agc_audio * state.volume).clamp(-1.0, 1.0);
+
+        // Step 7b: Auto Notch Filter (ANF)
+        let anf_audio = if state.noise.anf_enabled {
+            self.auto_notch.process(agc_audio)
+        } else {
+            agc_audio
+        };
+
+        // Step 7c: LMS Noise Reduction (NR)
+        let nr_audio = if state.noise.nr_enabled {
+            self.lms_nr.process(anf_audio, state.noise.nr_level)
+        } else {
+            anf_audio
+        };
+
+        // Step 7d: Audio Squelch (SQL)
+        let sql_audio = if state.noise.squelch_enabled {
+            self.squelch.process(nr_audio, self.latest_s_meter.2, state.squelch_db)
+        } else {
+            nr_audio
+        };
+
+        let final_audio = (sql_audio * state.volume).clamp(-1.0, 1.0);
 
         // Step 8: AF FFT Accumulation (Audio spectrum 0 - 24 kHz, interest in 0 - 4 kHz)
         let mut af_spectrum = None;

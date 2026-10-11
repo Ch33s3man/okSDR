@@ -1,11 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::dsp::DspPipeline;
 use crate::state::{RadioMode, SdrState};
+use crate::ui::recording_deck::DeckPlayback;
 
 pub struct AudioDeviceInfo {
     pub name: String,
@@ -126,7 +127,7 @@ impl AudioEngine {
         ui_tx: Sender<AudioMessage>,
         record_tx: Sender<f32>,
         is_recording: Arc<AtomicBool>,
-        deck_play_rx: Receiver<f32>,
+        deck_playback: DeckPlayback,
     ) -> Result<Self, anyhow::Error> {
         let host = cpal::default_host();
         let configured_device = {
@@ -139,7 +140,7 @@ impl AudioEngine {
         }
 
         // Bounded channel for passing demodulated audio from capture to playback
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<f32>(16384);
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<f32>(8192);
         let running = Arc::new(AtomicBool::new(true));
 
         // Try candidate devices until one successfully builds and starts a capture stream
@@ -181,7 +182,12 @@ impl AudioEngine {
 
             let rate = input_config.sample_rate().0;
             let channels = input_config.channels();
-            let stream_config: StreamConfig = input_config.clone().into();
+            let mut stream_config: StreamConfig = input_config.clone().into();
+            if let cpal::SupportedBufferSize::Range { min, max } = input_config.buffer_size() {
+                let desired_frames = 512;
+                let frames = desired_frames.clamp(*min, *max);
+                stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+            }
 
             let state_capture_f32 = Arc::clone(&state_arc);
             let state_capture_i16 = Arc::clone(&state_arc);
@@ -247,8 +253,8 @@ impl AudioEngine {
             match stream_res {
                 Ok(stream) => {
                     println!(
-                        "[Audio] Selected active capture device: {} ({} Hz, {} channels, format {:?})",
-                        dev_name, rate, channels, input_config.sample_format()
+                        "[Audio] Selected active capture device: {} ({} Hz, {} channels, format {:?}, buffer {:?})",
+                        dev_name, rate, channels, input_config.sample_format(), stream_config.buffer_size
                     );
                     capture_opt = Some(stream);
                     in_rate = rate;
@@ -291,13 +297,17 @@ impl AudioEngine {
             };
             let out_rate = out_config.sample_rate().0;
             let out_channels = out_config.channels();
-            let out_stream_config: StreamConfig = out_config.clone().into();
-            let ratio = 48000.0 / out_rate as f64;
+            let mut out_stream_config: StreamConfig = out_config.clone().into();
+            if let cpal::SupportedBufferSize::Range { min, max } = out_config.buffer_size() {
+                let desired_frames = 512;
+                let frames = desired_frames.clamp(*min, *max);
+                out_stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+            }
 
             let audio_rx_f32 = audio_rx.clone();
             let audio_rx_i16 = audio_rx.clone();
-            let deck_rx_f32 = deck_play_rx.clone();
-            let deck_rx_i16 = deck_play_rx.clone();
+            let deck_playback_f32 = deck_playback.clone();
+            let deck_playback_i16 = deck_playback.clone();
             let mut phase_f32 = 0.0f64;
             let mut s0_f32 = 0.0f32;
             let mut s1_f32 = 0.0f32;
@@ -311,15 +321,78 @@ impl AudioEngine {
                 SampleFormat::F32 => out_dev.build_output_stream(
                     &out_stream_config,
                     move |data: &mut [f32], _: &_| {
+                        let is_deck_playing = deck_playback_f32.is_playing.load(Ordering::Relaxed);
+                        if is_deck_playing {
+                            // Drain live audio queue so it doesn't backlog while playing recorded audio
+                            while audio_rx_f32.try_recv().is_ok() {}
+
+                            if let Ok(guard) = deck_playback_f32.samples.try_read() {
+                                let total = guard.len();
+                                let mut pos = deck_playback_f32.play_pos.load(Ordering::Relaxed);
+                                let in_rate = deck_playback_f32.sample_rate.load(Ordering::Relaxed) as f64;
+                                let ratio = in_rate / out_rate as f64;
+                                let is_loop = deck_playback_f32.loop_playback.load(Ordering::Relaxed);
+
+                                for frame in data.chunks_mut(out_channels as usize) {
+                                    while phase_f32 >= 1.0 {
+                                        phase_f32 -= 1.0;
+                                        s0_f32 = s1_f32;
+                                        if total > 0 && pos < total {
+                                            s1_f32 = guard[pos];
+                                            pos += 1;
+                                        } else if total > 0 && is_loop {
+                                            pos = 0;
+                                            s1_f32 = guard[0];
+                                        } else {
+                                            deck_playback_f32.is_playing.store(false, Ordering::Relaxed);
+                                            pos = 0;
+                                            s1_f32 = 0.0;
+                                        }
+                                    }
+                                    let sample = s0_f32 + (s1_f32 - s0_f32) * (phase_f32 as f32);
+                                    phase_f32 += ratio;
+
+                                    for ch in frame.iter_mut() {
+                                        *ch = sample;
+                                    }
+                                }
+                                deck_playback_f32.play_pos.store(pos, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        // --- Live SDR Low-Latency Playback & Queue Management ---
+                        // At 48 kHz: 480 samples = 10 ms, 960 samples = 20 ms, 1920 samples = 40 ms.
+                        // 1. Purge stale audio backlog:
+                        // If queue exceeds 1920 samples (>40 ms), drain excess down to 960 (~20 ms)
+                        // to eliminate the initial startup backlog and keep decode/playback near-realtime.
+                        let q_len = audio_rx_f32.len();
+                        if q_len > 1920 {
+                            let discard = q_len.saturating_sub(960);
+                            for _ in 0..discard {
+                                let _ = audio_rx_f32.try_recv();
+                            }
+                        }
+
+                        // 2. Adaptive Clock Drift Tracking:
+                        // Modulate resampling speed by ±0.25% (imperceptible to ear) to keep the queue
+                        // permanently locked around the 700..1200 sample sweet spot (~15..25 ms).
+                        let base_ratio = 48000.0 / out_rate as f64;
+                        let cur_q = audio_rx_f32.len();
+                        let drift_factor = if cur_q > 1200 {
+                            1.0025
+                        } else if cur_q < 600 {
+                            0.9975
+                        } else {
+                            1.0
+                        };
+                        let ratio = base_ratio * drift_factor;
+
                         for frame in data.chunks_mut(out_channels as usize) {
                             while phase_f32 >= 1.0 {
                                 phase_f32 -= 1.0;
                                 s0_f32 = s1_f32;
-                                let live_s = audio_rx_f32.try_recv().unwrap_or(0.0);
-                                s1_f32 = match deck_rx_f32.try_recv() {
-                                    Ok(deck_s) => deck_s,
-                                    Err(_) => live_s,
-                                };
+                                s1_f32 = audio_rx_f32.try_recv().unwrap_or(0.0);
                             }
                             let sample = s0_f32 + (s1_f32 - s0_f32) * (phase_f32 as f32);
                             phase_f32 += ratio;
@@ -335,15 +408,71 @@ impl AudioEngine {
                 SampleFormat::I16 => out_dev.build_output_stream(
                     &out_stream_config,
                     move |data: &mut [i16], _: &_| {
+                        let is_deck_playing = deck_playback_i16.is_playing.load(Ordering::Relaxed);
+                        if is_deck_playing {
+                            while audio_rx_i16.try_recv().is_ok() {}
+
+                            if let Ok(guard) = deck_playback_i16.samples.try_read() {
+                                let total = guard.len();
+                                let mut pos = deck_playback_i16.play_pos.load(Ordering::Relaxed);
+                                let in_rate = deck_playback_i16.sample_rate.load(Ordering::Relaxed) as f64;
+                                let ratio = in_rate / out_rate as f64;
+                                let is_loop = deck_playback_i16.loop_playback.load(Ordering::Relaxed);
+
+                                for frame in data.chunks_mut(out_channels as usize) {
+                                    while phase_i16 >= 1.0 {
+                                        phase_i16 -= 1.0;
+                                        s0_i16 = s1_i16;
+                                        if total > 0 && pos < total {
+                                            s1_i16 = guard[pos];
+                                            pos += 1;
+                                        } else if total > 0 && is_loop {
+                                            pos = 0;
+                                            s1_i16 = guard[0];
+                                        } else {
+                                            deck_playback_i16.is_playing.store(false, Ordering::Relaxed);
+                                            pos = 0;
+                                            s1_i16 = 0.0;
+                                        }
+                                    }
+                                    let sample = s0_i16 + (s1_i16 - s0_i16) * (phase_i16 as f32);
+                                    phase_i16 += ratio;
+
+                                    let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                    for ch in frame.iter_mut() {
+                                        *ch = s16;
+                                    }
+                                }
+                                deck_playback_i16.play_pos.store(pos, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        // --- Live SDR Low-Latency Playback & Queue Management ---
+                        let q_len = audio_rx_i16.len();
+                        if q_len > 1920 {
+                            let discard = q_len.saturating_sub(960);
+                            for _ in 0..discard {
+                                let _ = audio_rx_i16.try_recv();
+                            }
+                        }
+
+                        let base_ratio = 48000.0 / out_rate as f64;
+                        let cur_q = audio_rx_i16.len();
+                        let drift_factor = if cur_q > 1200 {
+                            1.0025
+                        } else if cur_q < 600 {
+                            0.9975
+                        } else {
+                            1.0
+                        };
+                        let ratio = base_ratio * drift_factor;
+
                         for frame in data.chunks_mut(out_channels as usize) {
                             while phase_i16 >= 1.0 {
                                 phase_i16 -= 1.0;
                                 s0_i16 = s1_i16;
-                                let live_s = audio_rx_i16.try_recv().unwrap_or(0.0);
-                                s1_i16 = match deck_rx_i16.try_recv() {
-                                    Ok(deck_s) => deck_s,
-                                    Err(_) => live_s,
-                                };
+                                s1_i16 = audio_rx_i16.try_recv().unwrap_or(0.0);
                             }
                             let sample = s0_i16 + (s1_i16 - s0_i16) * (phase_i16 as f32);
                             phase_i16 += ratio;

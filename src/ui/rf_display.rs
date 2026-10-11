@@ -18,13 +18,14 @@ pub struct RfDisplay {
     latest_spectrum: Vec<f32>,
     pub waterfall_floor_db: f32,
     pub waterfall_range_db: f32,
+    pub display_span_hz: f32,
     spectrum_min_db: f32,
     spectrum_max_db: f32,
     new_data_ready: bool,
 }
 
 impl RfDisplay {
-    pub fn new(waterfall_floor_db: f32, waterfall_range_db: f32) -> Self {
+    pub fn new(waterfall_floor_db: f32, waterfall_range_db: f32, display_span_hz: f32) -> Self {
         let size = WATERFALL_WIDTH * WATERFALL_HEIGHT;
         let waterfall_pixels = vec![Color32::from_rgb(0, 0, 40); size];
 
@@ -34,6 +35,7 @@ impl RfDisplay {
             latest_spectrum: vec![-120.0; RF_FFT_SIZE],
             waterfall_floor_db,
             waterfall_range_db,
+            display_span_hz,
             spectrum_min_db: -130.0,
             spectrum_max_db: -30.0,
             new_data_ready: false,
@@ -69,7 +71,7 @@ impl RfDisplay {
         mut on_tune_changed: impl FnMut(u64),
         mut on_lo_changed: impl FnMut(u64),
     ) {
-        let (lo_freq, tune_freq, filter_low, filter_high, sample_rate, mode, _cw_pitch_hz) = {
+        let (lo_freq, tune_freq, filter_low, filter_high, sample_rate, mode, _cw_pitch_hz, state_span) = {
             let st = state_arc.lock().unwrap();
             (
                 st.lo_freq,
@@ -79,7 +81,19 @@ impl RfDisplay {
                 st.sample_rate as f32,
                 st.mode,
                 st.cw_pitch_hz,
+                st.rf_display_span_hz,
             )
+        };
+        if state_span > 0.0 && (self.display_span_hz - state_span).abs() > 1.0 {
+            self.display_span_hz = state_span;
+        }
+
+        let max_span = sample_rate as f64;
+        let min_span = 10_000.0f64;
+        let cur_span = if self.display_span_hz <= 0.0 {
+            max_span
+        } else {
+            (self.display_span_hz as f64).clamp(min_span, max_span)
         };
 
         // In CW mode, incoming signals are offset from dial carrier by CW sidetone pitch
@@ -89,14 +103,31 @@ impl RfDisplay {
             0.0
         };
 
-        // Header with controls for Waterfall floor/range
+        // Header with controls for Waterfall floor/range/span
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("RF PANADAPTER & WATERFALL (±48 kHz Baseband)").size(11.0).strong());
+            let is_full_span = (cur_span - max_span).abs() < 500.0;
+            let title = if is_full_span {
+                format!("RF PANADAPTER & WATERFALL (±{:.0} kHz Baseband)", (max_span * 0.5) / 1000.0)
+            } else {
+                format!(
+                    "RF PANADAPTER & WATERFALL ({:.0} kHz Span / ±{:.0} kHz)",
+                    cur_span / 1000.0,
+                    (max_span * 0.5) / 1000.0
+                )
+            };
+            ui.label(egui::RichText::new(title).size(11.0).strong());
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new("Click: Tune 1kHz | Drag: Move Filter | Scroll: 1kHz Step").size(10.0).color(Color32::from_gray(160)));
-                
+                ui.label(
+                    egui::RichText::new("Click: Tune 1kHz | Drag: Move Filter | Scroll: 1kHz Step")
+                        .size(10.0)
+                        .color(Color32::from_gray(160)),
+                );
+
                 let range_txt = format!("Range: {:.0} dB", self.waterfall_range_db);
                 let floor_txt = format!("Floor: {:.0} dB", self.waterfall_floor_db);
+                let span_txt = format!("Span: {:.0} kHz", cur_span / 1000.0);
+
                 let range_res = scrollable_slider(
                     ui,
                     &mut self.waterfall_range_db,
@@ -105,6 +136,7 @@ impl RfDisplay {
                     |s| s.text(range_txt).show_value(false),
                 )
                 .on_hover_text("Scroll or drag waterfall dynamic range (2 dB step)");
+
                 let floor_res = scrollable_slider(
                     ui,
                     &mut self.waterfall_floor_db,
@@ -114,10 +146,28 @@ impl RfDisplay {
                 )
                 .on_hover_text("Scroll or drag waterfall noise floor (2 dB step)");
 
-                if range_res.changed() || floor_res.changed() {
+                let mut span_f32 = cur_span as f32;
+                let span_res = scrollable_slider(
+                    ui,
+                    &mut span_f32,
+                    min_span as f32..=max_span as f32,
+                    2000.0,
+                    |s| s.text(span_txt).show_value(false),
+                )
+                .on_hover_text(format!(
+                    "Scroll or drag visible RF frequency width/span (10 kHz to {:.0} kHz max I/Q)",
+                    max_span / 1000.0
+                ));
+
+                if span_res.changed() {
+                    self.display_span_hz = span_f32;
+                }
+
+                if range_res.changed() || floor_res.changed() || span_res.changed() {
                     let mut st = state_arc.lock().unwrap();
                     st.rf_waterfall_range_db = self.waterfall_range_db;
                     st.rf_waterfall_floor_db = self.waterfall_floor_db;
+                    st.rf_display_span_hz = self.display_span_hz;
                 }
             });
         });
@@ -192,18 +242,30 @@ impl RfDisplay {
             }
         }
 
-        // Frequency mapping helpers
-        let half_sr = sample_rate * 0.5;
+        // Baseband coverage of the full I/Q capture
+        let baseband_half = max_span * 0.5;
+        let baseband_min = lo_freq as f64 - baseband_half;
+        let baseband_max = lo_freq as f64 + baseband_half;
+
+        // Visible display frequency range [f_min, f_max] based on Span zoom
+        let half_span = cur_span * 0.5;
+        let center_f = (tune_freq as f64).clamp(baseband_min + half_span, baseband_max - half_span);
+        let f_min = center_f - half_span;
+        let f_max = center_f + half_span;
+
+        // Texture UV coordinates corresponding to visible [f_min, f_max]
+        let u_min = ((f_min - baseband_min) / max_span).clamp(0.0, 1.0) as f32;
+        let u_max = ((f_max - baseband_min) / max_span).clamp(0.0, 1.0) as f32;
+
         let freq_to_x = |f: f64| -> f32 {
-            let offset = f - lo_freq as f64;
-            let norm = (offset / sample_rate as f64) + 0.5;
+            let norm = (f - f_min) / (f_max - f_min);
             rect.min.x + (norm as f32 * rect.width())
         };
 
         let x_to_freq = |x: f32| -> u64 {
             let norm = ((x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-            let offset = (norm as f64 - 0.5) * sample_rate as f64;
-            ((lo_freq as f64 + offset).round()).max(0.0) as u64
+            let f = f_min + (norm as f64 * (f_max - f_min));
+            (f.round()).max(0.0) as u64
         };
 
         // 1. Backgrounds & Scale splitter borders
@@ -221,7 +283,7 @@ impl RfDisplay {
         painter.image(
             texture.id(),
             wf_rect,
-            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+            Rect::from_min_max(Pos2::new(u_min, 0.0), Pos2::new(u_max, 1.0)),
             Color32::WHITE,
         );
 
@@ -248,17 +310,26 @@ impl RfDisplay {
         // 3. Draw Spectrum Line
         let spec_len = self.latest_spectrum.len();
         if spec_len > 1 {
-            let mut points = Vec::with_capacity(spec_len);
-            for (i, &db) in self.latest_spectrum.iter().enumerate() {
-                let x = spec_rect.min.x + (i as f32 / spec_len as f32) * spec_rect.width();
+            let bin_hz = max_span / (spec_len - 1) as f64;
+            let start_bin = ((f_min - baseband_min) / bin_hz).floor().max(0.0) as usize;
+            let end_bin = (((f_max - baseband_min) / bin_hz).ceil() as usize).min(spec_len - 1);
+            let count = end_bin.saturating_sub(start_bin) + 1;
+
+            let mut points = Vec::with_capacity(count);
+            for i in start_bin..=end_bin {
+                let bin_f = baseband_min + (i as f64 * bin_hz);
+                let x = freq_to_x(bin_f);
+                let db = self.latest_spectrum[i];
                 let y_norm = 1.0 - ((db - self.spectrum_min_db) / (self.spectrum_max_db - self.spectrum_min_db)).clamp(0.0, 1.0);
                 let y = spec_rect.min.y + y_norm * spec_rect.height();
                 points.push(Pos2::new(x, y));
             }
-            painter.add(egui::Shape::line(
-                points,
-                Stroke::new(1.2f32, Color32::from_rgb(80, 220, 120)),
-            ));
+            if points.len() > 1 {
+                painter.add(egui::Shape::line(
+                    points,
+                    Stroke::new(1.2f32, Color32::from_rgb(80, 220, 120)),
+                ));
+            }
         }
 
         // 4. Passband highlight & markers across Spectrum, Scale, and Waterfall
@@ -303,34 +374,50 @@ impl RfDisplay {
         );
 
         // 5. Frequency Scale Markers (MHz / kHz)
-        let f_min = lo_freq as f64 - half_sr as f64;
-        let f_max = lo_freq as f64 + half_sr as f64;
-        let step = 10_000.0; // 10 kHz markers
+        let step = if cur_span <= 20_000.0 {
+            2_000.0
+        } else if cur_span <= 40_000.0 {
+            5_000.0
+        } else {
+            10_000.0
+        };
         let start_marker = (f_min / step).ceil() * step;
         let mut f = start_marker;
 
         while f <= f_max {
             let x = freq_to_x(f);
-            let is_major = (f / 50_000.0).round() * 50_000.0 == f;
+            let is_major = if cur_span <= 20_000.0 {
+                (f / 10_000.0).round() * 10_000.0 == f
+            } else if cur_span <= 40_000.0 {
+                (f / 20_000.0).round() * 20_000.0 == f
+            } else {
+                (f / 50_000.0).round() * 50_000.0 == f
+            };
 
-            let tick_h = if is_major { 8.0 } else { 4.0 };
+            let tick_h = if is_major { 8.0 } else { 5.0 };
             painter.line_segment(
                 [Pos2::new(x, scale_rect.min.y), Pos2::new(x, scale_rect.min.y + tick_h)],
-                Stroke::new(1.0f32, Color32::from_gray(180)),
+                Stroke::new(1.0f32, if is_major { Color32::from_gray(210) } else { Color32::from_gray(160) }),
             );
 
-            if is_major {
-                let mhz = f / 1_000_000.0;
-                painter.text(
-                    Pos2::new(x, scale_rect.min.y + 14.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{:.3}", mhz),
-                    egui::FontId::monospace(10.0),
-                    Color32::from_gray(210),
-                );
-            }
+            // Numerical label for every frequency division
+            let mhz = f / 1_000_000.0;
+            let label_col = if is_major {
+                Color32::from_gray(240)
+            } else {
+                Color32::from_gray(190)
+            };
+            painter.text(
+                Pos2::new(x, scale_rect.min.y + 14.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.3}", mhz),
+                egui::FontId::monospace(10.0),
+                label_col,
+            );
+
             f += step;
         }
+
 
         // 6. Mouse hover cursor line & frequency readout indicator
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {

@@ -24,10 +24,10 @@ fn main() -> eframe::Result<()> {
     // 2. Setup Message Channels between Audio/DSP thread and GUI
     let (ui_tx, ui_rx) = bounded::<AudioMessage>(64);
 
-    // Setup RX Audio Recording & Playback Channels
+    // Setup RX Audio Recording & Playback
     let is_recording = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (record_tx, record_rx) = bounded::<f32>(96000 * 2);
-    let (deck_play_tx, deck_play_rx) = bounded::<f32>(48000 * 2);
+    let deck_playback = ui::recording_deck::DeckPlayback::default();
 
     // 3. Start Audio Engine (Capture Cubilux CB5 96kHz I/Q & Playback)
     let audio_engine = match AudioEngine::start(
@@ -35,7 +35,7 @@ fn main() -> eframe::Result<()> {
         ui_tx,
         record_tx,
         Arc::clone(&is_recording),
-        deck_play_rx,
+        deck_playback.clone(),
     ) {
         Ok(engine) => {
             println!("[Main] Audio engine started successfully.");
@@ -54,7 +54,7 @@ fn main() -> eframe::Result<()> {
     let recording_deck = ui::recording_deck::RecordingDeck::new(
         is_recording,
         record_rx,
-        deck_play_tx,
+        deck_playback,
     );
 
     // 6. Setup native GUI window

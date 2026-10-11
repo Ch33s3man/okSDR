@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RadioMode {
     USB,
     LSB,
@@ -28,6 +28,16 @@ impl RadioMode {
             RadioMode::CW => (450.0, 950.0),
             RadioMode::AM => (-3000.0, 3000.0),
             RadioMode::FM => (-6000.0, 6000.0),
+        }
+    }
+
+    pub fn default_filter_edges_with_pitch(&self, cw_pitch: f32) -> (f32, f32) {
+        match self {
+            RadioMode::CW => {
+                let pitch = cw_pitch.clamp(300.0, 1500.0);
+                ((pitch - 250.0).max(50.0), pitch + 250.0)
+            }
+            _ => self.default_filter_edges(),
         }
     }
 
@@ -186,6 +196,76 @@ impl Default for IqCalibration {
     }
 }
 
+/// Runtime status of the CAT link (never saved to disk).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum RigStatus {
+    /// No CAT connection requested (startup, or user chose SDR-only).
+    #[default]
+    Idle,
+    /// Connection in progress; the string describes the current step.
+    Connecting(String),
+    /// rigctld is running and the G90 is answering frequency queries.
+    Connected,
+    /// A connection attempt failed; the string explains why.
+    Failed(String),
+    /// A working connection stopped responding.
+    Lost(String),
+}
+
+/// Xiegu G90 Hamlib model number (`rigctl -l | grep G90`).
+pub const HAMLIB_MODEL_G90: u32 = 3088;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoiseControls {
+    pub nr_enabled: bool,
+    pub nr_level: f32, // 0.0 to 1.0 (default 0.5)
+    pub nb_enabled: bool,
+    pub nb_threshold: f32, // 1.5 to 8.0 (default 3.5)
+    pub anf_enabled: bool, // Automatic Notch Filter
+    pub squelch_enabled: bool,
+}
+
+impl Default for NoiseControls {
+    fn default() -> Self {
+        Self {
+            nr_enabled: false,
+            nr_level: 0.5,
+            nb_enabled: false,
+            nb_threshold: 3.5,
+            anf_enabled: false,
+            squelch_enabled: false,
+        }
+    }
+}
+
+pub fn default_mode_filters() -> HashMap<RadioMode, (f32, f32)> {
+    let mut m = HashMap::new();
+    m.insert(RadioMode::USB, RadioMode::USB.default_filter_edges());
+    m.insert(RadioMode::LSB, RadioMode::LSB.default_filter_edges());
+    m.insert(RadioMode::CW, RadioMode::CW.default_filter_edges());
+    m.insert(RadioMode::AM, RadioMode::AM.default_filter_edges());
+    m.insert(RadioMode::FM, RadioMode::FM.default_filter_edges());
+    m
+}
+
+fn compare_mode_filters(
+    a: &HashMap<RadioMode, (f32, f32)>,
+    b: &HashMap<RadioMode, (f32, f32)>,
+) -> bool {
+    for m in &[RadioMode::USB, RadioMode::LSB, RadioMode::CW, RadioMode::AM, RadioMode::FM] {
+        match (a.get(m), b.get(m)) {
+            (Some((a_low, a_high)), Some((b_low, b_high))) => {
+                if (a_low - b_low).abs() >= 1e-4 || (a_high - b_high).abs() >= 1e-4 {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SdrState {
@@ -194,8 +274,11 @@ pub struct SdrState {
     pub mode: RadioMode,
     pub filter_low: f32,    // Hz offset from tune frequency
     pub filter_high: f32,   // Hz offset from tune frequency
+    #[serde(default = "default_mode_filters")]
+    pub mode_filters: HashMap<RadioMode, (f32, f32)>, // Saved filter edges per mode (low, high)
     pub volume: f32,        // 0.0 to 1.0
     pub squelch_db: f32,    // -130 dB to 0 dB
+    pub noise: NoiseControls,
     pub agc_speed: AgcSpeed,
     pub agc_gain: f32,      // Manual gain factor if AGC Off
     pub iq_cal: IqCalibration,
@@ -209,12 +292,20 @@ pub struct SdrState {
     pub rf_waterfall_floor_db: f32, // Waterfall floor (-150 to -40 dB, default -120 dB)
     pub rf_waterfall_range_db: f32, // Waterfall range (10 to 80 dB, default 50 dB)
     pub rf_spectrum_ratio: f32, // Ratio of RF display for panadapter vs waterfall (default 0.45)
+    pub rf_display_span_hz: f32, // Display frequency span/width in Hz (default 96000.0, or 0.0 for max)
+    pub show_af_display: bool,  // Whether bottom AF spectrum & waterfall is visible (default true)
     pub af_panel_height: f32,   // Height of AF bottom panel in pixels (default 150.0)
     pub af_spectrum_ratio: f32, // Ratio of AF display for panadapter vs waterfall (default 0.45)
     pub cw_pitch_hz: f32,       // CW sidetone pitch & waterfall offset in Hz (default 700.0)
     pub recordings_dir: String, // Directory where RX audio recordings are saved
     pub audio_input_device: String, // Preferred audio capture device name or "Auto (Cubilux / Default)"
     pub serial_device: String,      // Preferred CAT serial device path or "Auto-Detect"
+    pub cat_baud: u32,              // G90 CI-V baud rate (factory default 19200)
+    pub civ_address: u8,            // G90 CI-V address (factory default 0x70)
+    pub hamlib_model: u32,          // Hamlib rig model (3088 = Xiegu G90)
+    pub cat_auto_connect: bool,     // Connect automatically on startup (dialog still shown on failure)
+    #[serde(skip)]
+    pub rig_status: RigStatus,
 }
 
 impl Default for SdrState {
@@ -229,6 +320,9 @@ impl Default for SdrState {
         let mode = default_band.default_mode();
         let (f_low, f_high) = mode.default_filter_edges();
 
+        let mut mode_filters = default_mode_filters();
+        mode_filters.insert(mode, (f_low, f_high));
+
         let default_rec_dir = if let Ok(home) = std::env::var("HOME") {
             format!("{}/okSDR_Recordings", home)
         } else {
@@ -241,8 +335,10 @@ impl Default for SdrState {
             mode,
             filter_low: f_low,
             filter_high: f_high,
+            mode_filters,
             volume: 0.7,
             squelch_db: -130.0,
+            noise: NoiseControls::default(),
             agc_speed: AgcSpeed::Med,
             agc_gain: 1.0,
             iq_cal: IqCalibration::default(),
@@ -255,12 +351,19 @@ impl Default for SdrState {
             rf_waterfall_floor_db: -120.0,
             rf_waterfall_range_db: 50.0,
             rf_spectrum_ratio: 0.45,
+            rf_display_span_hz: 96000.0,
+            show_af_display: true,
             af_panel_height: 150.0,
             af_spectrum_ratio: 0.45,
             cw_pitch_hz: 700.0,
             recordings_dir: default_rec_dir,
             audio_input_device: "Auto (Cubilux / Default)".to_string(),
             serial_device: "Auto-Detect".to_string(),
+            cat_baud: 19200,
+            civ_address: 0x70,
+            hamlib_model: HAMLIB_MODEL_G90,
+            cat_auto_connect: false,
+            rig_status: RigStatus::Idle,
         }
     }
 }
@@ -272,8 +375,10 @@ impl PartialEq for SdrState {
             && self.mode == other.mode
             && (self.filter_low - other.filter_low).abs() < 1e-4
             && (self.filter_high - other.filter_high).abs() < 1e-4
+            && compare_mode_filters(&self.mode_filters, &other.mode_filters)
             && (self.volume - other.volume).abs() < 1e-4
             && (self.squelch_db - other.squelch_db).abs() < 1e-4
+            && self.noise == other.noise
             && self.agc_speed == other.agc_speed
             && (self.agc_gain - other.agc_gain).abs() < 1e-4
             && self.iq_cal == other.iq_cal
@@ -285,12 +390,18 @@ impl PartialEq for SdrState {
             && (self.rf_waterfall_floor_db - other.rf_waterfall_floor_db).abs() < 1e-4
             && (self.rf_waterfall_range_db - other.rf_waterfall_range_db).abs() < 1e-4
             && (self.rf_spectrum_ratio - other.rf_spectrum_ratio).abs() < 1e-4
+            && (self.rf_display_span_hz - other.rf_display_span_hz).abs() < 1e-4
+            && self.show_af_display == other.show_af_display
             && (self.af_panel_height - other.af_panel_height).abs() < 1e-4
             && (self.af_spectrum_ratio - other.af_spectrum_ratio).abs() < 1e-4
             && (self.cw_pitch_hz - other.cw_pitch_hz).abs() < 1e-4
             && self.recordings_dir == other.recordings_dir
             && self.audio_input_device == other.audio_input_device
             && self.serial_device == other.serial_device
+            && self.cat_baud == other.cat_baud
+            && self.civ_address == other.civ_address
+            && self.hamlib_model == other.hamlib_model
+            && self.cat_auto_connect == other.cat_auto_connect
     }
 }
 
@@ -323,6 +434,7 @@ impl SdrState {
                         if let Ok(mut state) = serde_json::from_str::<Self>(&content) {
                             println!("[Config] Loaded previous session settings from {}", path.display());
                             state.rigctld_connected = false;
+                            state.rig_status = RigStatus::Idle;
                             return state;
                         } else {
                             eprintln!("[Config] Warning: Failed to parse {}, trying next candidate.", path.display());
@@ -348,6 +460,47 @@ impl SdrState {
             } else {
                 println!("[Config] Saved session settings to {}", path.display());
             }
+        }
+    }
+
+    /// Get saved or default filter edges (low, high) for a specific mode.
+    pub fn get_filter_for_mode(&self, mode: RadioMode) -> (f32, f32) {
+        self.mode_filters
+            .get(&mode)
+            .copied()
+            .unwrap_or_else(|| mode.default_filter_edges_with_pitch(self.cw_pitch_hz))
+    }
+
+    /// Store filter edges for a specific mode. If that mode is currently active,
+    /// also updates filter_low and filter_high immediately.
+    pub fn set_filter_for_mode(&mut self, mode: RadioMode, low: f32, high: f32) {
+        self.mode_filters.insert(mode, (low, high));
+        if self.mode == mode {
+            self.filter_low = low;
+            self.filter_high = high;
+        }
+    }
+
+    /// Reset filter settings for the specified mode to standard default and apply if active.
+    pub fn reset_filter_for_mode(&mut self, mode: RadioMode) -> (f32, f32) {
+        let def = mode.default_filter_edges_with_pitch(self.cw_pitch_hz);
+        self.mode_filters.insert(mode, def);
+        if self.mode == mode {
+            self.filter_low = def.0;
+            self.filter_high = def.1;
+        }
+        def
+    }
+
+    /// Switch active radio mode: saves active filter edges to previous mode,
+    /// updates mode, and recalls saved (or default) filter edges for the new mode.
+    pub fn switch_mode(&mut self, new_mode: RadioMode) {
+        if self.mode != new_mode {
+            self.mode_filters.insert(self.mode, (self.filter_low, self.filter_high));
+            self.mode = new_mode;
+            let (low, high) = self.get_filter_for_mode(new_mode);
+            self.filter_low = low;
+            self.filter_high = high;
         }
     }
 }
@@ -414,6 +567,8 @@ mod tests {
         original.filter_low = 200.0;
         original.filter_high = 2800.0;
         original.cw_pitch_hz = 700.0;
+        original.rf_display_span_hz = 48000.0;
+        original.show_af_display = false;
         original.iq_cal.gain_balance = 0.05;
         original.iq_cal.phase_balance = -0.02;
 
@@ -491,5 +646,88 @@ mod tests {
 
         assert_eq!(Band::M10.ssb_calling_freq(), 28_400_000);
         assert_eq!(Band::M10.default_mode(), RadioMode::USB);
+    }
+
+    #[test]
+    fn test_af_display_and_span_defaults() {
+        let state = SdrState::default();
+        assert!(state.show_af_display);
+        assert_eq!(state.rf_display_span_hz, 96000.0);
+
+        // Visible window math test
+        let lo_freq = 14_070_000f64;
+        let sample_rate = 96_000.0f64;
+        let baseband_half = sample_rate * 0.5;
+        let baseband_min = lo_freq - baseband_half;
+        let baseband_max = lo_freq + baseband_half;
+
+        // When zoomed to 20 kHz span and tuned to 14.074 MHz
+        let cur_span = 20_000.0f64;
+        let tune_freq = 14_074_000f64;
+        let half_span = cur_span * 0.5;
+        let center_f = tune_freq.clamp(baseband_min + half_span, baseband_max - half_span);
+        let f_min = center_f - half_span;
+        let f_max = center_f + half_span;
+
+        assert_eq!(f_max - f_min, cur_span);
+        assert!(f_min >= baseband_min);
+        assert!(f_max <= baseband_max);
+    }
+
+    #[test]
+    fn test_per_mode_filter_settings_and_reset() {
+        let mut state = SdrState::default();
+
+        // 1. Initial defaults
+        assert_eq!(state.get_filter_for_mode(RadioMode::USB), (100.0, 2500.0));
+        assert_eq!(state.get_filter_for_mode(RadioMode::LSB), (-2500.0, -100.0));
+        assert_eq!(state.get_filter_for_mode(RadioMode::CW), (450.0, 950.0));
+
+        // 2. Switch to CW mode and mess with CW filter
+        state.switch_mode(RadioMode::CW);
+        assert_eq!(state.mode, RadioMode::CW);
+        assert_eq!(state.filter_low, 450.0);
+        assert_eq!(state.filter_high, 950.0);
+
+        // User customizes CW filter (e.g. 550 to 850 Hz)
+        state.set_filter_for_mode(RadioMode::CW, 550.0, 850.0);
+        assert_eq!(state.filter_low, 550.0);
+        assert_eq!(state.filter_high, 850.0);
+
+        // 3. Switch to LSB mode: must recall LSB filter (-2500, -100), NOT remain in CW positive frequencies!
+        state.switch_mode(RadioMode::LSB);
+        assert_eq!(state.mode, RadioMode::LSB);
+        assert_eq!(state.filter_low, -2500.0);
+        assert_eq!(state.filter_high, -100.0);
+
+        // User customizes LSB filter (e.g. -2800 to -200 Hz)
+        state.set_filter_for_mode(RadioMode::LSB, -2800.0, -200.0);
+        assert_eq!(state.filter_low, -2800.0);
+        assert_eq!(state.filter_high, -200.0);
+
+        // 4. Switch back to CW mode: custom CW filter must be recalled!
+        state.switch_mode(RadioMode::CW);
+        assert_eq!(state.mode, RadioMode::CW);
+        assert_eq!(state.filter_low, 550.0);
+        assert_eq!(state.filter_high, 850.0);
+
+        // 5. Switch back to LSB mode: custom LSB filter must be recalled!
+        state.switch_mode(RadioMode::LSB);
+        assert_eq!(state.mode, RadioMode::LSB);
+        assert_eq!(state.filter_low, -2800.0);
+        assert_eq!(state.filter_high, -200.0);
+
+        // 6. Test Reset button functionality: resets active LSB mode back to clean defaults
+        let reset_edges = state.reset_filter_for_mode(RadioMode::LSB);
+        assert_eq!(reset_edges, (-2500.0, -100.0));
+        assert_eq!(state.filter_low, -2500.0);
+        assert_eq!(state.filter_high, -100.0);
+
+        // 7. Verify serialization roundtrip preserves mode_filters
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: SdrState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, loaded);
+        assert_eq!(loaded.get_filter_for_mode(RadioMode::CW), (550.0, 850.0));
+        assert_eq!(loaded.get_filter_for_mode(RadioMode::LSB), (-2500.0, -100.0));
     }
 }

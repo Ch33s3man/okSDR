@@ -1,28 +1,47 @@
 use eframe::egui::{self, Button, Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::state::{Band, SdrState};
 
+/// Shared thread-safe playback state accessed directly by the audio output stream callback.
+#[derive(Clone)]
+pub struct DeckPlayback {
+    pub samples: Arc<RwLock<Vec<f32>>>,
+    pub sample_rate: Arc<AtomicU32>,
+    pub is_playing: Arc<AtomicBool>,
+    pub play_pos: Arc<AtomicUsize>,
+    pub loop_playback: Arc<AtomicBool>,
+}
+
+impl Default for DeckPlayback {
+    fn default() -> Self {
+        Self {
+            samples: Arc::new(RwLock::new(Vec::with_capacity(48000 * 30))),
+            sample_rate: Arc::new(AtomicU32::new(48000)),
+            is_playing: Arc::new(AtomicBool::new(false)),
+            play_pos: Arc::new(AtomicUsize::new(0)),
+            loop_playback: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 pub struct RecordingDeck {
     pub is_recording: Arc<AtomicBool>,
     pub record_rx: Receiver<f32>,
-    pub playback_tx: Sender<f32>,
 
     // Recorded samples buffer (48 kHz mono PCM)
     pub samples: Arc<RwLock<Vec<f32>>>,
-    pub sample_rate: u32,
+    pub sample_rate: Arc<AtomicU32>,
 
     // Playback state
     pub is_playing: Arc<AtomicBool>,
     pub play_pos: Arc<AtomicUsize>,
     pub loop_playback: Arc<AtomicBool>,
     pub playback_volume: f32,
-
-    feeder_running: Arc<AtomicBool>,
 
     // Metadata for current session
     pub record_start_time: Option<String>,
@@ -43,63 +62,17 @@ impl RecordingDeck {
     pub fn new(
         is_recording: Arc<AtomicBool>,
         record_rx: Receiver<f32>,
-        playback_tx: Sender<f32>,
+        playback: DeckPlayback,
     ) -> Self {
-        let samples = Arc::new(RwLock::new(Vec::with_capacity(48000 * 30)));
-        let is_playing = Arc::new(AtomicBool::new(false));
-        let play_pos = Arc::new(AtomicUsize::new(0));
-        let loop_playback = Arc::new(AtomicBool::new(false));
-        let feeder_running = Arc::new(AtomicBool::new(true));
-
-        // Background playback feeder thread
-        let samples_clone = Arc::clone(&samples);
-        let is_playing_clone = Arc::clone(&is_playing);
-        let play_pos_clone = Arc::clone(&play_pos);
-        let loop_clone = Arc::clone(&loop_playback);
-        let feeder_running_clone = Arc::clone(&feeder_running);
-        let play_tx_clone = playback_tx.clone();
-
-        std::thread::spawn(move || {
-            while feeder_running_clone.load(Ordering::Relaxed) {
-                if is_playing_clone.load(Ordering::Relaxed) {
-                    let lock = samples_clone.read().unwrap();
-                    let total = lock.len();
-                    if total > 0 {
-                        let mut cur_pos = play_pos_clone.load(Ordering::Relaxed);
-                        let chunk_size = 480.min(total.saturating_sub(cur_pos));
-                        for i in 0..chunk_size {
-                            let s = lock[cur_pos + i];
-                            let _ = play_tx_clone.try_send(s);
-                        }
-                        cur_pos += chunk_size;
-                        if cur_pos >= total {
-                            if loop_clone.load(Ordering::Relaxed) {
-                                cur_pos = 0;
-                            } else {
-                                is_playing_clone.store(false, Ordering::Relaxed);
-                                cur_pos = 0;
-                            }
-                        }
-                        play_pos_clone.store(cur_pos, Ordering::Relaxed);
-                    } else {
-                        is_playing_clone.store(false, Ordering::Relaxed);
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-
         Self {
             is_recording,
             record_rx,
-            playback_tx,
-            samples,
-            sample_rate: 48000,
-            is_playing,
-            play_pos,
-            loop_playback,
+            samples: playback.samples,
+            sample_rate: playback.sample_rate,
+            is_playing: playback.is_playing,
+            play_pos: playback.play_pos,
+            loop_playback: playback.loop_playback,
             playback_volume: 1.0,
-            feeder_running,
             record_start_time: None,
             record_band: "40m".to_string(),
             record_mode: "LSB".to_string(),
@@ -108,6 +81,20 @@ impl RecordingDeck {
             recent_recordings: Vec::new(),
             last_scan_time: Instant::now() - Duration::from_secs(60),
             loaded_filename: None,
+        }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Relaxed)
+    }
+
+    pub fn playback_source(&self) -> DeckPlayback {
+        DeckPlayback {
+            samples: Arc::clone(&self.samples),
+            sample_rate: Arc::clone(&self.sample_rate),
+            is_playing: Arc::clone(&self.is_playing),
+            play_pos: Arc::clone(&self.play_pos),
+            loop_playback: Arc::clone(&self.loop_playback),
         }
     }
 
@@ -142,7 +129,7 @@ impl RecordingDeck {
     pub fn stop_recording(&mut self) {
         self.is_recording.store(false, Ordering::Relaxed);
         self.update_recorder();
-        let len_secs = self.samples.read().unwrap().len() as f32 / self.sample_rate as f32;
+        let len_secs = self.samples.read().unwrap().len() as f32 / self.sample_rate() as f32;
         self.set_status(&format!("⏹ Recording stopped ({:.1}s captured)", len_secs));
     }
 
@@ -157,7 +144,7 @@ impl RecordingDeck {
             return;
         }
         let cur = self.play_pos.load(Ordering::Relaxed);
-        let step = (delta_secs * self.sample_rate as f32) as i64;
+        let step = (delta_secs * self.sample_rate() as f32) as i64;
         let new_pos = (cur as i64 + step).clamp(0, total as i64) as usize;
         self.play_pos.store(new_pos, Ordering::Relaxed);
     }
@@ -190,9 +177,9 @@ impl RecordingDeck {
         let filename = format!("{}_{}_{}_{:.4}MHz.wav", timestamp, band, mode, freq_mhz);
         let path = dir.join(&filename);
 
-        match write_wav_file(&path, &samples, self.sample_rate) {
+        match write_wav_file(&path, &samples, self.sample_rate()) {
             Ok(_) => {
-                let secs = samples.len() as f32 / self.sample_rate as f32;
+                let secs = samples.len() as f32 / self.sample_rate() as f32;
                 let msg = format!("💾 Saved {} ({:.1}s)", filename, secs);
                 self.set_status(&msg);
                 self.loaded_filename = Some(filename);
@@ -214,7 +201,7 @@ impl RecordingDeck {
                 let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let secs = data.len() as f32 / rate as f32;
                 *self.samples.write().unwrap() = data;
-                self.sample_rate = rate;
+                self.sample_rate.store(rate, Ordering::Relaxed);
                 self.play_pos.store(0, Ordering::Relaxed);
                 self.loaded_filename = Some(fname.clone());
                 self.set_status(&format!("▶ Loaded {} ({:.1}s)", fname, secs));
@@ -263,8 +250,8 @@ impl RecordingDeck {
         let cur_pos = self.play_pos.load(Ordering::Relaxed);
 
         let total_samples = self.samples.read().unwrap().len();
-        let total_secs = total_samples as f32 / self.sample_rate as f32;
-        let cur_secs = cur_pos as f32 / self.sample_rate as f32;
+        let total_secs = total_samples as f32 / self.sample_rate() as f32;
+        let cur_secs = cur_pos as f32 / self.sample_rate() as f32;
 
         egui::Frame::group(ui.style())
             .fill(Color32::from_rgb(14, 18, 26))
@@ -404,7 +391,7 @@ impl RecordingDeck {
                             let scroll = ui.input(|i| i.raw_scroll_delta.y);
                             if scroll.abs() > 0.0 {
                                 let step_secs = if scroll > 0.0 { 1.0 } else { -1.0 };
-                                let step_samples = (step_secs * self.sample_rate as f32) as i64;
+                                let step_samples = (step_secs * self.sample_rate() as f32) as i64;
                                 let new_p = (cur_pos as i64 + step_samples).clamp(0, total_samples as i64) as usize;
                                 self.play_pos.store(new_p, Ordering::Relaxed);
                             }

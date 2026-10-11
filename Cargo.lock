@@ -2473,6 +2473,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "libc",
  "num-complex",
  "rustfft",
  "serde",
